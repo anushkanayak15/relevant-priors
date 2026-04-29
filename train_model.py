@@ -1,5 +1,4 @@
 import json
-import re
 import joblib
 import numpy as np
 import pandas as pd
@@ -8,96 +7,22 @@ from sklearn.compose import ColumnTransformer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import accuracy_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import GroupShuffleSplit
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-
-# Basic cleanup so descriptions are easier to compare.
-# I am keeping only lowercase letters, numbers, and spaces so punctuation does not affect matching.
-def normalize(text):
-    return re.sub(r"[^a-z0-9 ]", " ", str(text).lower())
-
-
-# Roughly identify the imaging modality from keywords in the study description.
-# This is not perfect, but it gives the model an extra helpful feature beyond raw text.
-def modality(desc):
-    if "mri" in desc or "mr " in desc:
-        return "mri"
-    if "ct" in desc:
-        return "ct"
-    if "xr" in desc or "xray" in desc or "x ray" in desc:
-        return "xray"
-    if "ultrasound" in desc or "us " in desc:
-        return "us"
-    if "mam" in desc or "breast" in desc:
-        return "mammo"
-    if "pet" in desc:
-        return "pet"
-    return "other"
-
-
-# Roughly identify body region from common radiology words.
-# A study can match more than one region, so I join all the regions that are found.
-def region(desc):
-    groups = {
-        "brain": ["brain", "head", "stroke", "intracranial"],
-        "chest": ["chest", "lung", "thorax", "pulmonary", "rib", "ribs"],
-        "abdomen": ["abdomen", "abdominal", "liver", "kidney", "renal", "bladder"],
-        "pelvis": ["pelvis", "pelvic"],
-        "spine": ["spine", "cervical", "thoracic", "lumbar"],
-        "breast": ["breast", "mam", "mammo", "mammography", "tomo"],
-        "heart": ["heart", "cardiac", "coronary", "echo", "myo", "spect"],
-        "extremity": ["knee", "ankle", "foot", "hand", "wrist", "leg", "femur"],
-        "neck": ["neck", "carotid"],
-    }
-
-    found = []
-    for r, words in groups.items():
-        if any(w in desc for w in words):
-            found.append(r)
-
-    return " ".join(found) if found else "unknown"
-
-
-# Build one row of features for a current/prior study pair.
-# The model gets both text-based features and simple manual comparison features.
-def make_features(current_desc, prior_desc):
-    cur = normalize(current_desc)
-    prior = normalize(prior_desc)
-
-    cur_words = set(cur.split())
-    prior_words = set(prior.split())
-
-    # Jaccard overlap is a simple way to measure how many words the two descriptions share.
-    overlap = len(cur_words & prior_words)
-    union = len(cur_words | prior_words)
-    jaccard = overlap / union if union else 0
-
-    cur_mod = modality(cur)
-    prior_mod = modality(prior)
-
-    cur_region = region(cur)
-    prior_region = region(prior)
-
-    return {
-        # This combined text lets TF-IDF learn words/phrases across the pair together.
-        "text": f"current: {cur} prior: {prior} pair: {cur} [SEP] {prior}",
-        "cur_text": cur,
-        "prior_text": prior,
-        "cur_mod": cur_mod,
-        "prior_mod": prior_mod,
-        "cur_region": cur_region,
-        "prior_region": prior_region,
-        "same_modality": int(cur_mod == prior_mod),
-        "same_region": int(bool(set(cur_region.split()) & set(prior_region.split()))),
-        "exact_match": int(cur == prior),
-        "word_overlap": overlap,
-        "jaccard": jaccard,
-        "cur_len": len(cur_words),
-        "prior_len": len(prior_words),
-    }
-
+from features import make_features, FEATURE_COLS
+# Training hyperparameters are centralized in config.py
+# so experiments can be changed without editing model code.
+from config import (
+    C,
+    MAX_ITER,
+    RANDOM_STATE,
+    TEST_SIZE,
+    PAIR_MAX_FEATURES,
+    CUR_MAX_FEATURES,
+    PRIOR_MAX_FEATURES
+)
 
 # Load the public training data.
 with open("relevant_priors_public.json", "r") as f:
@@ -114,6 +39,7 @@ rows = []
 # Convert each current/prior pair into one training row.
 for case in data["cases"]:
     case_id = case["case_id"]
+    patient_id = case.get("patient_id", case_id)
     current_desc = case["current_study"]["study_description"]
 
     for prior in case["prior_studies"]:
@@ -125,50 +51,46 @@ for case in data["cases"]:
             continue
 
         feats = make_features(current_desc, prior["study_description"])
+        feats["case_id"] = case_id
+        feats["patient_id"] = patient_id
         feats["label"] = labels[key]
+
         rows.append(feats)
 
 # Put all rows into a dataframe for sklearn.
 df = pd.DataFrame(rows)
 
 # These are the exact columns the model expects during training and prediction.
-feature_cols = [
-    "text",
-    "cur_text",
-    "prior_text",
-    "cur_mod",
-    "prior_mod",
-    "cur_region",
-    "prior_region",
-    "same_modality",
-    "same_region",
-    "exact_match",
-    "word_overlap",
-    "jaccard",
-    "cur_len",
-    "prior_len",
-]
+feature_cols = FEATURE_COLS
 
 X = df[feature_cols]
 y = df["label"]
 
-# Split into train and validation so we can tune the probability threshold.
-# Stratify keeps the positive/negative label balance similar in both splits.
-X_train, X_val, y_train, y_val = train_test_split(
-    X,
-    y,
-    test_size=0.2,
-    random_state=42,
-    stratify=y
+# Split into train and validation by case_id.
+# This is better than random pair-level splitting because it prevents priors from the same case
+# from appearing in both training and validation.
+groups = df["case_id"]
+
+splitter = GroupShuffleSplit(
+    n_splits=1,
+    test_size=TEST_SIZE,
+    random_state=RANDOM_STATE
 )
+
+train_idx, val_idx = next(splitter.split(df, df["label"], groups=groups))
+
+X_train = df.iloc[train_idx][feature_cols]
+X_val = df.iloc[val_idx][feature_cols]
+y_train = df.iloc[train_idx]["label"]
+y_val = df.iloc[val_idx]["label"]
 
 # TF-IDF handles the text features, and StandardScaler handles the numeric features.
 # I used larger max_features because radiology descriptions can have useful phrase patterns.
 preprocess = ColumnTransformer(
     transformers=[
-        ("pair_text", TfidfVectorizer(ngram_range=(1, 5), min_df=2, max_features=250000), "text"),
-        ("cur_text", TfidfVectorizer(ngram_range=(1, 3), min_df=2, max_features=50000), "cur_text"),
-        ("prior_text", TfidfVectorizer(ngram_range=(1, 3), min_df=2, max_features=50000), "prior_text"),
+        ("pair_text", TfidfVectorizer(ngram_range=(1, 5), min_df=2, max_features=PAIR_MAX_FEATURES), "text"),
+        ("cur_text", TfidfVectorizer(ngram_range=(1, 3), min_df=2, max_features=CUR_MAX_FEATURES), "cur_text"),
+        ("prior_text", TfidfVectorizer(ngram_range=(1, 3), min_df=2, max_features=PRIOR_MAX_FEATURES), "prior_text"),
         ("cur_mod", TfidfVectorizer(), "cur_mod"),
         ("prior_mod", TfidfVectorizer(), "prior_mod"),
         ("cur_region", TfidfVectorizer(), "cur_region"),
@@ -189,8 +111,8 @@ preprocess = ColumnTransformer(
 model = Pipeline([
     ("features", preprocess),
     ("clf", LogisticRegression(
-        max_iter=7000,
-        C=12.0,
+        max_iter=MAX_ITER,
+        C=C,
         class_weight=None,
         solver="liblinear"
     ))
